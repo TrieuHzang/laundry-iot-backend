@@ -7,55 +7,50 @@ const PayOS = require("@payos/node");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ─── PayOS instance ────────────────────────────────────────────────────────────
 const payos = new PayOS(
   process.env.PAYOS_CLIENT_ID,
   process.env.PAYOS_API_KEY,
   process.env.PAYOS_CHECKSUM_KEY
 );
 
-// ─── Middleware ────────────────────────────────────────────────────────────────
-// Cho phép tất cả origin (frontend build được serve cùng server nên không cần CORS)
-app.use(cors());
+app.use(cors({
+  origin: "*",
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+}));
+
 app.use(express.json());
 
-// ─── Serve React frontend (Vite build output) ─────────────────────────────────
-const publicDir = path.join(__dirname, "public");
-app.use(express.static(publicDir));
-
-// ─── In-memory store cho trạng thái đơn hàng ─────────────────────────────────
-// Trong production nên dùng database (MongoDB, Redis, v.v.)
 const orderStore = new Map();
 
-// ─── Routes ────────────────────────────────────────────────────────────────────
+app.get("/api/health", (req, res) => {
+  res.json({
+    status: "OK",
+    message: "Laundry IoT Backend đang chạy",
+    timestamp: new Date().toISOString(),
+  });
+});
 
-/**
- * POST /api/create-payment-link
- * Body: { machineId, machineName, service, amount }
- * Returns: { checkoutUrl, orderCode, paymentLinkId }
- */
 app.post("/api/create-payment-link", async (req, res) => {
   try {
     const { machineId, machineName, service, amount } = req.body;
 
     if (!machineId || !amount) {
-      return res
-        .status(400)
-        .json({ error: "Thiếu thông tin: machineId và amount là bắt buộc" });
+      return res.status(400).json({
+        error: "Thiếu machineId hoặc amount",
+      });
     }
 
-    // Tạo orderCode là số nguyên dương, unique, tối đa 9 chữ số
     const orderCode = Number(String(Date.now()).slice(-8));
 
-    // PUBLIC_URL được set khi dùng tunnel (ngrok, localtunnel, ...)
-    // Fallback về localhost nếu chạy dev
-    const publicUrl = process.env.PUBLIC_URL || `http://localhost:${PORT}`;
-    const frontendUrl = process.env.FRONTEND_URL || publicUrl;
+    const frontendUrl =
+      process.env.FRONTEND_URL ||
+      "https://laundry-iot-web.kiananh123.workers.dev";
 
     const paymentData = {
       orderCode,
-      amount: Math.round(amount), // số nguyên, đơn vị VNĐ
-      description: `Laundry-${machineId}`.slice(0, 25), // max 25 ký tự
+      amount: Math.round(amount),
+      description: `Laundry-${machineId}`.slice(0, 25),
       returnUrl: `${frontendUrl}/?payment=success&orderCode=${orderCode}`,
       cancelUrl: `${frontendUrl}/?payment=cancel&orderCode=${orderCode}`,
       items: [
@@ -69,7 +64,6 @@ app.post("/api/create-payment-link", async (req, res) => {
 
     const paymentLink = await payos.createPaymentLink(paymentData);
 
-    // Lưu trạng thái đơn hàng
     orderStore.set(String(orderCode), {
       status: "PENDING",
       machineId,
@@ -79,8 +73,6 @@ app.post("/api/create-payment-link", async (req, res) => {
       createdAt: new Date().toISOString(),
       paymentLinkId: paymentLink.paymentLinkId,
     });
-
-    console.log(`[PayOS] Tạo đơn hàng #${orderCode} - ${machineName} - ${amount}đ`);
 
     res.json({
       success: true,
@@ -98,22 +90,23 @@ app.post("/api/create-payment-link", async (req, res) => {
   }
 });
 
-/**
- * GET /api/payment-status/:orderCode
- * Frontend polling để kiểm tra trạng thái đơn hàng
- */
 app.get("/api/payment-status/:orderCode", async (req, res) => {
   try {
     const { orderCode } = req.params;
-
     const localOrder = orderStore.get(String(orderCode));
 
     if (!localOrder) {
-      return res.status(404).json({ error: "Không tìm thấy đơn hàng" });
+      return res.status(404).json({
+        error: "Không tìm thấy đơn hàng",
+      });
     }
 
     if (localOrder.status === "PAID") {
-      return res.json({ status: "PAID", orderCode, ...localOrder });
+      return res.json({
+        status: "PAID",
+        orderCode,
+        ...localOrder,
+      });
     }
 
     try {
@@ -123,57 +116,37 @@ app.get("/api/payment-status/:orderCode", async (req, res) => {
         localOrder.status = "PAID";
         localOrder.paidAt = new Date().toISOString();
         orderStore.set(String(orderCode), localOrder);
-        console.log(`[PayOS] Đơn hàng #${orderCode} ĐÃ THANH TOÁN`);
-      } else if (paymentInfo.status === "CANCELLED") {
+      }
+
+      if (paymentInfo.status === "CANCELLED") {
         localOrder.status = "CANCELLED";
         orderStore.set(String(orderCode), localOrder);
       }
 
-      return res.json({ status: localOrder.status, orderCode, ...localOrder });
+      return res.json({
+        status: localOrder.status,
+        orderCode,
+        ...localOrder,
+      });
     } catch {
-      return res.json({ status: localOrder.status, orderCode, ...localOrder });
+      return res.json({
+        status: localOrder.status,
+        orderCode,
+        ...localOrder,
+      });
     }
   } catch (error) {
     console.error("[PayOS] Lỗi kiểm tra trạng thái:", error);
-    res.status(500).json({ error: "Lỗi kiểm tra trạng thái thanh toán" });
+    res.status(500).json({
+      error: "Lỗi kiểm tra trạng thái thanh toán",
+    });
   }
 });
 
-/**
- * POST /api/webhook
- * payOS gọi endpoint này sau khi thanh toán thành công/thất bại
- */
-app.post("/api/webhook", async (req, res) => {
-  try {
-    const webhookData = payos.verifyPaymentWebhookData(req.body);
-    const { orderCode, code, desc, data } = webhookData;
-
-    console.log(`[Webhook] Nhận webhook cho đơn #${orderCode}: ${code} - ${desc}`);
-
-    if (code === "00") {
-      const order = orderStore.get(String(orderCode));
-      if (order) {
-        order.status = "PAID";
-        order.paidAt = new Date().toISOString();
-        order.transactionId = data?.reference;
-        orderStore.set(String(orderCode), order);
-        console.log(`[Webhook] Đơn hàng #${orderCode} THANH TOÁN THÀNH CÔNG`);
-      }
-    }
-
-    res.json({ success: true });
-  } catch (error) {
-    console.error("[Webhook] Lỗi xử lý webhook:", error);
-    res.status(400).json({ error: "Webhook không hợp lệ" });
-  }
-});
-
-/**
- * POST /api/cancel-payment/:orderCode
- */
 app.post("/api/cancel-payment/:orderCode", async (req, res) => {
   try {
     const { orderCode } = req.params;
+
     await payos.cancelPaymentLink(orderCode, "Người dùng huỷ đơn hàng");
 
     const order = orderStore.get(String(orderCode));
@@ -185,43 +158,47 @@ app.post("/api/cancel-payment/:orderCode", async (req, res) => {
     res.json({ success: true });
   } catch (error) {
     console.error("[PayOS] Lỗi huỷ đơn hàng:", error);
-    res.status(500).json({ error: "Không thể huỷ đơn hàng" });
+    res.status(500).json({
+      error: "Không thể huỷ đơn hàng",
+    });
   }
 });
 
-/**
- * GET /api/health
- */
-app.get("/api/health", (req, res) => {
-  res.json({
-    status: "OK",
-    message: "Laundry IoT Backend đang chạy",
-    publicUrl: process.env.PUBLIC_URL || `http://localhost:${PORT}`,
-    timestamp: new Date().toISOString(),
-  });
-});
+app.post("/api/webhook", async (req, res) => {
+  try {
+    const webhookData = payos.verifyPaymentWebhookData(req.body);
+    const { orderCode, code, desc, data } = webhookData;
 
-// ─── SPA fallback — mọi route không phải /api đều trả về index.html ──────────
-app.get("*", (req, res) => {
-  const indexPath = path.join(publicDir, "index.html");
-  res.sendFile(indexPath, (err) => {
-    if (err) {
-      res.status(404).send(
-        "Frontend chưa được build. Chạy: cd ../laundry-iot-web && npm run build"
-      );
+    console.log(`[Webhook] Đơn #${orderCode}: ${code} - ${desc}`);
+
+    if (code === "00") {
+      const order = orderStore.get(String(orderCode));
+      if (order) {
+        order.status = "PAID";
+        order.paidAt = new Date().toISOString();
+        order.transactionId = data?.reference;
+        orderStore.set(String(orderCode), order);
+      }
     }
-  });
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error("[Webhook] Lỗi:", error);
+    res.status(400).json({
+      error: "Webhook không hợp lệ",
+    });
+  }
 });
 
-// ─── Start server ─────────────────────────────────────────────────────────────
+// Frontend để cuối cùng
+const publicDir = path.join(__dirname, "public");
+app.use(express.static(publicDir));
+
+app.get("*", (req, res) => {
+  res.sendFile(path.join(publicDir, "index.html"));
+});
+
 app.listen(PORT, "0.0.0.0", () => {
-  const publicUrl = process.env.PUBLIC_URL || `http://localhost:${PORT}`;
-  console.log(`\n🚀 Server chạy tại:`);
-  console.log(`   Local:   http://localhost:${PORT}`);
-  console.log(`   Network: http://0.0.0.0:${PORT}`);
-  if (process.env.PUBLIC_URL) {
-    console.log(`   Public:  ${publicUrl}  🌍`);
-  }
-  console.log(`📡 PayOS Client ID: ${process.env.PAYOS_CLIENT_ID?.slice(0, 8)}...`);
-  console.log(`✅ Sẵn sàng nhận thanh toán!\n`);
+  console.log(`Server running on port ${PORT}`);
+  console.log(`Backend URL: https://laundry-iot-backend.onrender.com`);
 });
