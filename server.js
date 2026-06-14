@@ -50,8 +50,10 @@ async function sendCommandToBlynk(machineId) {
   }
 
   try {
-    const url =
-      `https://blynk.cloud/external/api/update?token=${token}&V0=${encodeURIComponent(command)}`;
+    const pin = process.env.BLYNK_PIN || "V0";
+
+const url =
+  `https://blynk.cloud/external/api/update?token=${token}&${pin}=${encodeURIComponent(command)}`;
 
     const response = await fetch(url);
 
